@@ -1,0 +1,48 @@
+# master-template.yml @ templates_repo
+parameters:
+- name: buildSteps
+  type: stepList
+  default: []
+
+# 宣告你要引用的外部 Repo (存放共用 Skills 的地方)
+resources:
+  repositories:
+    - repository: gemini-file # 給這個資源一個 YAML 內的代號
+      type: git
+      name: '{ProjectName}/GEMINI' # 請替換成實際的專案與 Repo 名稱
+
+jobs:
+- job: StandardPipelineJob
+  pool:
+    name: '{AgentPoolName}'
+
+  steps:
+  # 使用 podman 啟動容器，並將 Agent 主機的資料夾掛載到容器內
+  - script: |
+      podman run -d --name sdlc-pipeline-container \
+        --network=host \
+        --uts=host \
+        --user $(id -u):$(id -g) \
+        -v $(Agent.BuildDirectory):/workspace \
+        -v /workspace/tools:/azp/externals \
+        registry.access.redhat.com/ubi8/python-311:latest \
+        sleep infinity
+
+      echo '確認掛載資料夾內容 /workspace'
+      ls -al /workspace
+
+      echo '確認掛載資料夾內容 /azp/externals'
+      ls -al /azp/externals
+    displayName: 'Start container with mounted volume'
+
+  # 套入共用的 Code Review 步驟
+  - template: code-review-template.yaml # 引用同 Repo 下的檢查步驟
+  
+  # 插入專案端傳進來的自定義步驟
+  - ${{ parameters.buildSteps }}      
+
+  # 最後清理容器，確保不會留下殘留的容器
+  - script: |
+      podman rm -f sdlc-pipeline-container
+    displayName: 'Clean up container'
+    condition: always() # 確保無論前面步驟成功與否都會執行清理容器的動作

@@ -1,0 +1,167 @@
+steps:
+- checkout: self
+  path: $(Build.Repository.Name)
+  # 確保在容器內也能使用 Git 認證，拉取 PR 相關的 Git 資訊
+  persistCredentials: true 
+  clean: true
+# Clone 存放共用 skills Repo 內的 skill 檔案，將其下載到 $(Agent.BuildDirectory)/skills 
+- checkout: gemini-file
+  path: tmp_gemini
+  clean: true
+
+- script: |
+    podman exec sdlc-pipeline-container bash -c "
+      echo '🎉 PR 驗證管線已成功觸發！'
+      echo '目前運行的 Agent 機器名稱是: $(Agent.Name)'
+      echo '準備進行程式碼編譯與測試...'
+    "
+  displayName: '環境測試與歡迎訊息'
+
+- script: |
+    podman exec sdlc-pipeline-container bash -c "
+
+      echo '新增暫存資料夾，將skill、policy等檔案放入該資料夾...'
+      mkdir -p /tmp/gemini_file/.gemini
+      cp -r /workspace/tmp_gemini/* /tmp/gemini_file/.gemini
+
+      echo '確認檔案已成功複製到暫存資料夾 /tmp/gemini_file/.gemini'
+      ls -al /tmp/gemini_file/.gemini
+
+    "
+  displayName: '載入 Gemini CLI、Skill、Policy'
+
+- script: |
+    podman exec -w /workspace/$(Build.Repository.Name) sdlc-pipeline-container bash -c "
+
+      # 如果遇到 Git SSL 驗證問題，可以暫時禁用 SSL 驗證（不建議在生產環境中使用）
+      export GIT_SSL_NO_VERIFY=true
+
+      # 解決 Git 安全警告
+      git config --global --add safe.directory /workspace/$(Build.Repository.Name)
+
+      echo '正在偵測遠端主分支名稱...'
+      # 透過 git ls-remote 檢查分支是否存在於遠端
+      if git ls-remote --exit-code --heads origin main > /dev/null 2>&1; then
+        BASE_BRANCH='main'
+      elif git ls-remote --exit-code --heads origin master > /dev/null 2>&1; then
+        BASE_BRANCH='master'
+      else
+        echo '❌ 錯誤：遠端找不到 main 也找不到 master 分支！'
+        exit 1
+      fi
+      echo '🎉 偵測成功！將使用 '\$BASE_BRANCH' 作為比較基準。'
+      
+      # 拉取動態決定的主分支
+      git fetch origin \$BASE_BRANCH:\$BASE_BRANCH
+    "
+  displayName: '準備 Git 環境'
+  condition: eq(variables['Build.Reason'], 'PullRequest')
+
+- script: |
+    podman exec -w /workspace/$(Build.Repository.Name) sdlc-pipeline-container bash -c "
+      echo '=== 系統環境確認 ==='
+      python --version
+      node --version
+      
+      echo '=== 準備 AI Code Review 執行環境 ==='
+
+      # 賦予 node、gemini 執行權限
+      echo '設定 node、gemini 執行權限...'
+      chmod +x /azp/externals/v34/node
+      chmod +x /azp/externals/v34/gemini
+
+      # 設定當前所需環境變數
+      echo '設定環境變數...'
+      export GOOGLE_GENAI_USE_VERTEXAI=true
+      export GOOGLE_CLOUD_PROJECT=$(GOOGLE_CLOUD_PROJECT)
+      export GOOGLE_CLOUD_LOCATION='global'
+      export GOOGLE_APPLICATION_CREDENTIALS='/tmp/gemini_file/.gemini/cert/{VertexAI-Private-key}.json'
+      export COLORTERM=truecolor
+
+      # 設定 GEMINI_CLI_HOME 環境變數，預防 Gemini CLI 吃不到 Skills、Policy 的設定
+      export GEMINI_CLI_HOME='/tmp/gemini_file/'
+
+      # 設定容器時區為台北時間
+      export TZ='Asia/Taipei'
+
+      echo '=== 完成 AI Code Review 執行環境 ==='
+
+      echo '=== 開始執行 AI Code Review ==='
+      # 立刻呼叫剛建好的腳本
+      /azp/externals/v34/gemini -y -p '請使用code-review-skill進行程式碼掃描'
+      echo '=== 完成執行 AI Code Review ==='
+    "    
+  displayName: '設定權限並執行 AI Code Review'
+
+- script: |
+    echo "準備建立 PR 留言腳本..."
+
+    cat << 'EOF' > $(Agent.BuildDirectory)/$(Build.Repository.Name)/send_pr_comment.sh
+    #!/bin/bash
+    echo '準備將 AI Code Review 報告發布到 PR 留言板...'
+
+    REPORT_DIR="/workspace/$(Build.Repository.Name)/code-review/references/report"
+    
+    # 使用 ls -t 動態尋找該目錄下最新的 .md 檔案
+    REPORT_PATH=$(ls -t "$REPORT_DIR"/*.md 2>/dev/null | head -n 1)
+
+    # 檢查是否真的有找到檔案（變數為空或檔案不存在就報錯）
+    if [ -z "$REPORT_PATH" ] || [ ! -f "$REPORT_PATH" ]; then
+      echo "❌ 找不到任何 Markdown 報告檔案！請確認 AI 是否成功產出報告於目錄：$REPORT_DIR"
+      exit 1
+    fi
+
+    if ! command -v jq &> /dev/null; then
+      echo '正在安裝 jq 工具...'
+      dnf install -y jq > /dev/null
+    fi
+
+    PREFIX=$'🤖 **AI Code Review 審查結果**\n\n'
+
+    jq -Rs --arg prefix "$PREFIX" '{
+      comments: [
+        {
+          parentCommentId: 0,
+          content: ($prefix + .),
+          commentType: 1
+        }
+      ],
+      status: 1
+    }' "$REPORT_PATH" > /tmp/pr_payload.json
+
+    echo "成功產生 JSON Payload，準備呼叫 API..."
+    
+    # 組合 API 網址
+    API_URL="${ADO_COLLECTION_URI}${ADO_PROJECT_ID}/_apis/git/repositories/${ADO_REPO_ID}/pullRequests/${ADO_PR_ID}/threads?api-version=6.0"
+    
+    # 印出網址以便除錯 (不會有機密資訊)
+    echo "🔗 請求網址: $API_URL"
+
+    # 【關鍵修正】：加入 -k 略過 SSL 憑證檢查，並將 -s 改為 -sS 顯示詳細錯誤
+    HTTP_STATUS=$(curl -sS -k -o /tmp/api_response.txt -w "%{http_code}" -X POST \
+      -H "Authorization: Bearer ${ADO_TOKEN}" \
+      -H "Content-Type: application/json" \
+      -d @/tmp/pr_payload.json \
+      "$API_URL")
+
+    if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+      echo "🎉 成功透過 curl 發布報告至 PR 留言！"
+    else
+      echo "❌ 發布失敗！HTTP 狀態碼: $HTTP_STATUS"
+      cat /tmp/api_response.txt 2>/dev/null || echo "無 API 回應內容。"
+      exit 1
+    fi
+    EOF
+
+    podman exec \
+      -e ADO_COLLECTION_URI="$(System.CollectionUri)" \
+      -e ADO_PROJECT_ID="$(System.TeamProjectId)" \
+      -e ADO_REPO_ID="$(Build.Repository.ID)" \
+      -e ADO_PR_ID="$(System.PullRequest.PullRequestId)" \
+      -e ADO_TOKEN="$(System.AccessToken)" \
+      sdlc-pipeline-container bash /workspace/$(Build.Repository.Name)/send_pr_comment.sh
+
+  displayName: '發布報告至 PR 留言'
+  condition: eq(variables['Build.Reason'], 'PullRequest')
+  env:
+    SYSTEM_ACCESSTOKEN: $(System.AccessToken)
